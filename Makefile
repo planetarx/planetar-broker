@@ -9,9 +9,10 @@ TOOLS    := shm-consumer
 TEST_CLIENTS := tests/pub-tcp tests/pub-udp tests/pub-shm \
                 tests/sub-tcp tests/sub-shm tests/ring-hop
 TEST_UNIT    := tests/test-unit
+TEST_HLC     := tests/test-hlc-integ
 TEST_HDRS    := tests/zmesg-test.h tests/latency-stats.h
 
-.PHONY: all clean run debug test test-unit test-functional perf
+.PHONY: all clean run debug test test-unit test-functional test-hlc perf
 
 all: $(BIN) $(TOOLS)
 
@@ -38,9 +39,18 @@ $(TEST_UNIT): tests/test-unit.c planetar-broker.c $(TEST_HDRS)
 $(TEST_CLIENTS): tests/%: tests/%.c $(TEST_HDRS)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# Self-contained HLC v2 stamping test. Spawns its own broker on
+# isolated ports (13971+) with RING_ID set; never touches 12001-3.
+$(TEST_HLC): tests/test-hlc-integ.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # Unit tests only (fast, no broker process needed).
 test-unit: $(TEST_UNIT)
 	./$(TEST_UNIT)
+
+# HLC stamping end-to-end (needs the broker binary built).
+test-hlc: $(BIN) $(TEST_HLC)
+	./$(TEST_HLC)
 
 # Functional/integration suite (starts its own broker; aborts if a
 # broker is already listening on 12001).
@@ -60,4 +70,4 @@ perf: all $(TEST_CLIENTS)
 	./tests/test-perf.sh $(N)
 
 clean:
-	rm -f $(BIN) $(TOOLS) $(TEST_UNIT) $(TEST_CLIENTS)
+	rm -f $(BIN) $(TOOLS) $(TEST_UNIT) $(TEST_CLIENTS) $(TEST_HLC)

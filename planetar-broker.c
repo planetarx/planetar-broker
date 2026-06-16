@@ -143,6 +143,7 @@
 #include <sys/socket.h>     /* sockets, sendmsg/SCM_RIGHTS           */
 #include <sys/stat.h>       /* mkdir, chmod                          */
 #include <sys/syscall.h>    /* SYS_memfd_create                      */
+#include <sys/timex.h>      /* adjtimex — HLC advisory clock bound   */
 #include <sys/types.h>
 #include <sys/uio.h>        /* writev for contiguous WAL records     */
 #include <sys/un.h>         /* sockaddr_un (Unix domain socket)      */
@@ -194,11 +195,35 @@
 
 /* zmesg envelope facts (mirrors zmesg.h in ~/github/sness23/zmesg).
  * Deliberately copied, not #included — the broker needs only these
- * three facts about the format, but they MUST track zmesg changes
- * in lockstep (the same constants also live in shm-consumer.c). */
+ * facts about the format, but they MUST track zmesg changes in
+ * lockstep (the same constants also live in shm-consumer.c and
+ * tests/zmesg-test.h — three copies total).
+ *
+ * Version 2 (SPEC-hlc-envelope.md in planetarx/planetar-disruptor)
+ * inserts a 32-byte sequencing extension at offset 66, stamped by
+ * THIS broker at append time; the variable-length strings move from
+ * offset 66 to 98. v1 and v2 messages coexist on the wire — every
+ * parse site must branch on the version byte to find the topic. */
 #define ZMESG_MAGIC          0x5A4D5347u    /* "ZMSG" read little-endian */
-#define ZMESG_FIXED_HDR      66u    /* fixed-header bytes; topic next */
+#define ZMESG_FIXED_HDR      66u    /* v1 fixed header; topic next    */
+#define ZMESG_FIXED_HDR_V2   98u    /* v2 fixed header (66 + 32 ext)  */
+#define ZMESG_OFF_VERSION    4u     /* u8 envelope version            */
+#define ZMESG_OFF_HDR_LEN    6u     /* u16 header_len (fixed+strings) */
 #define ZMESG_OFF_TOPIC_LEN  48u    /* u16 topic_len lives here       */
+#define ZMESG_OFF_HLC_PHYS   66u    /* u64 hlc_physical_ns (v2)       */
+#define ZMESG_OFF_HLC_LOG    74u    /* u32 hlc_logical (v2)           */
+#define ZMESG_OFF_RING_ID    78u    /* u64 origin ring id (v2)        */
+#define ZMESG_OFF_LOCAL_SEQ  86u    /* u64 origin ring seq (v2)       */
+#define ZMESG_OFF_ERR_BOUND  94u    /* u32 advisory clock error (v2)  */
+#define ZMESG_HLC_EXT_LEN    32u    /* size of the v2 extension       */
+
+/*
+ * zmesg_fixed_hdr — fixed-header size for an envelope version.
+ * Callers have already checked ver is 1 or 2.
+ */
+static inline uint32_t zmesg_fixed_hdr(uint8_t ver) {
+    return ver == 2 ? ZMESG_FIXED_HDR_V2 : ZMESG_FIXED_HDR;
+}
 
 /* WAL constants — see the WAL section for the formats they govern. */
 #define WAL_DIR_DEFAULT      "./wal"        /* env WAL_DIR overrides  */
@@ -426,6 +451,242 @@ static uint64_t now_ns_real(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* ---------------- HLC stamping (zmesg v2) ---------------- */
+
+/*
+ * The broker is the single writer of its ring, so it owns the zmesg v2
+ * sequencing tuple: at accept time each message is stamped with a
+ * hybrid logical clock value (Kulkarni/Demirbas HLC), this broker's
+ * ring id, and the message's g_sequence as local_seq. The HLC is the
+ * cross-ring merge key for the distributed-disruptor design; spec and
+ * canonical twin implementation live in
+ * planetarx/planetar-disruptor/SPEC-hlc-envelope.md and
+ * ~/github/sness23/zmesg/hlc.h — change semantics in lockstep.
+ *
+ * Enabled by the RING_ID environment variable (a u64, or any string,
+ * which is FNV-1a-hashed). Unset/empty/0 disables stamping and the
+ * broker behaves exactly as before (v2 arrivals still route fine —
+ * parse sites are version-aware regardless).
+ *
+ * Liskov's rule applies throughout: the clock is used for performance
+ * (cross-ring ordering quality), never correctness — a wrong clock can
+ * only make downstream merge order worse, not break the broker.
+ */
+typedef struct {
+    int      enabled;        /* RING_ID set and nonzero                */
+    uint64_t ring_id;        /* this broker's ring identity            */
+    uint64_t last_physical;  /* highest HLC physical ns issued/seen    */
+    uint32_t last_logical;   /* HLC logical counter at last_physical   */
+    uint32_t err_bound_ns;   /* cached advisory clock error bound      */
+    uint64_t err_sampled_ns; /* wall-clock ns of the last cache fill   */
+} hlc_t;
+
+static hlc_t g_hlc;
+
+/* Messages stamped / observed / passed oversize-unstamped, for the
+ * shutdown counter line. */
+static unsigned long long g_hlc_stamped = 0;
+static unsigned long long g_hlc_observed = 0;
+static unsigned long long g_hlc_oversize = 0;
+
+/*
+ * fnv1a64 — tiny non-cryptographic string hash, used only to derive a
+ * u64 ring id from a human-readable RING_ID value. Stable across runs
+ * and platforms (pure arithmetic, no byte-order dependence).
+ */
+static uint64_t fnv1a64(const char *s) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    while (*s) { h ^= (uint8_t)*s++; h *= 0x100000001B3ull; }
+    return h;
+}
+
+/*
+ * hlc_err_bound — advisory clock error bound in ns, cached for one
+ * second because adjtimex() is a syscall and this sits on the hot
+ * path. maxerror is reported in microseconds. 0 means "unknown";
+ * UINT32_MAX means "explicitly unbounded" (kernel says unsynced).
+ * Consumers treat this as a hint only (Liskov's rule).
+ *
+ *   ts   the message's already-sampled wall-clock ns (one identity
+ *        per message — we never re-sample time on the hot path).
+ */
+static uint32_t hlc_err_bound(uint64_t ts) {
+    if (ts - g_hlc.err_sampled_ns < 1000000000ull)
+        return g_hlc.err_bound_ns;            /* cache is fresh        */
+    g_hlc.err_sampled_ns = ts;
+    struct timex tx;
+    memset(&tx, 0, sizeof tx);
+    int rc = adjtimex(&tx);
+    if (rc < 0)              g_hlc.err_bound_ns = 0;          /* unknown */
+    else if (rc == TIME_ERROR) g_hlc.err_bound_ns = UINT32_MAX; /* unsynced */
+    else {
+        uint64_t ns = (uint64_t)tx.maxerror * 1000ull;
+        if (ns >= UINT32_MAX) ns = UINT32_MAX - 1;
+        g_hlc.err_bound_ns = (uint32_t)ns;
+    }
+    return g_hlc.err_bound_ns;
+}
+
+/*
+ * hlc_tick — issue the next HLC value for a locally accepted message.
+ * The physical component never decreases (a stalled or backward-
+ * jumping clock bumps the logical counter instead), so stamps from one
+ * ring are strictly increasing even across clock trouble.
+ *
+ *   ts        the message's shared wall-clock sample.
+ *   out_phys  receives the stamp's physical ns.
+ *   out_log   receives the stamp's logical counter.
+ */
+static void hlc_tick(uint64_t ts, uint64_t *out_phys, uint32_t *out_log) {
+    if (ts > g_hlc.last_physical) {
+        g_hlc.last_physical = ts;
+        g_hlc.last_logical = 0;
+    } else {
+        g_hlc.last_logical++;
+    }
+    *out_phys = g_hlc.last_physical;
+    *out_log  = g_hlc.last_logical;
+}
+
+/*
+ * hlc_observe — absorb the stamp of a message that another ring
+ * already stamped (it arrived here by relay). The origin stamp is
+ * never modified; we only advance our own clock so that anything WE
+ * stamp afterwards sorts after everything we have seen
+ * (happens-before across the relay hop).
+ */
+static void hlc_observe(uint64_t m_phys, uint32_t m_log, uint64_t ts) {
+    if (ts > g_hlc.last_physical && ts > m_phys) {
+        g_hlc.last_physical = ts;
+        g_hlc.last_logical = 0;
+    } else if (m_phys > g_hlc.last_physical) {
+        g_hlc.last_physical = m_phys;
+        g_hlc.last_logical = m_log + 1;
+    } else if (m_phys == g_hlc.last_physical) {
+        if (m_log > g_hlc.last_logical) g_hlc.last_logical = m_log;
+        g_hlc.last_logical++;
+    } else {
+        g_hlc.last_logical++;
+    }
+}
+
+/*
+ * g_stamp_buf — staging for stamped envelopes, shared by all three
+ * ingest paths (safe: the reactor is single-threaded and every message
+ * is fully routed before the next is parsed). Laid out as one TCP
+ * frame so fan-out can use it directly:
+ *
+ *   [0..3]  big-endian frame length   [4..]  stamped envelope
+ *
+ * Static because FRAME_MAX_LEN is far too large for the stack.
+ */
+static uint8_t g_stamp_buf[4 + FRAME_MAX_LEN];
+
+/*
+ * hlc_stamp_frame — produce the routable bytes for a validated
+ * envelope under HLC stamping. Exactly one of three things happens:
+ *
+ *   v1 envelope          expanded into g_stamp_buf as v2: bytes
+ *                        [0,66) copied, the 32-byte extension written
+ *                        (fresh HLC tick, our ring_id, seq as
+ *                        local_seq, cached err bound), strings+payload
+ *                        copied to offset 98, version and header_len
+ *                        updated. Returns the new envelope length.
+ *
+ *   v2, ring_id == 0     a v2-shaped envelope nobody stamped (a
+ *                        producer pre-sized the extension): copied
+ *                        verbatim and the extension filled in place in
+ *                        the copy. Returns the (unchanged) length.
+ *
+ *   v2, ring_id != 0     already stamped by its origin ring — the
+ *                        stamp is immutable. We hlc_observe() it and
+ *                        return 0: route the ORIGINAL bytes untouched.
+ *
+ * Oversize guard: a v1 envelope within 32 bytes of FRAME_MAX_LEN
+ * cannot grow; it is routed unstamped (returns 0) and counted — a
+ * degraded message beats a dropped one.
+ *
+ *   env, len   validated envelope (magic checked, ver 1 or 2,
+ *              len >= fixed header for ver).
+ *   seq, ts    the message's shared identity pair.
+ *
+ * Returns the stamped envelope length in g_stamp_buf+4 (with the BE
+ * frame length already written at offset 0), or 0 meaning "route the
+ * original bytes".
+ */
+static uint32_t hlc_stamp_frame(const uint8_t *env, uint32_t len,
+                                uint64_t seq, uint64_t ts) {
+    uint8_t ver = env[ZMESG_OFF_VERSION];
+
+    if (ver == 2) {
+        uint64_t rid;
+        memcpy(&rid, env + ZMESG_OFF_RING_ID, 8);
+        if (rid != 0) {
+            uint64_t mp; uint32_t ml;
+            memcpy(&mp, env + ZMESG_OFF_HLC_PHYS, 8);
+            memcpy(&ml, env + ZMESG_OFF_HLC_LOG, 4);
+            hlc_observe(mp, ml, ts);
+            g_hlc_observed++;
+            return 0;                          /* pass through as-is   */
+        }
+        /* Pre-sized but unstamped: copy, then fill our tuple. */
+        memcpy(g_stamp_buf + 4, env, len);
+    } else {
+        /* v1 -> v2: grow by 32. Refuse (gracefully) at the size cap. */
+        if (len + ZMESG_HLC_EXT_LEN > FRAME_MAX_LEN) {
+            g_hlc_oversize++;
+            return 0;
+        }
+        memcpy(g_stamp_buf + 4, env, ZMESG_FIXED_HDR);
+        memcpy(g_stamp_buf + 4 + ZMESG_FIXED_HDR_V2,
+               env + ZMESG_FIXED_HDR, len - ZMESG_FIXED_HDR);
+        g_stamp_buf[4 + ZMESG_OFF_VERSION] = 2;
+        uint16_t hdr_len;
+        memcpy(&hdr_len, env + ZMESG_OFF_HDR_LEN, 2);
+        hdr_len = (uint16_t)(hdr_len + ZMESG_HLC_EXT_LEN);
+        memcpy(g_stamp_buf + 4 + ZMESG_OFF_HDR_LEN, &hdr_len, 2);
+        len += ZMESG_HLC_EXT_LEN;
+    }
+
+    /* Write the sequencing tuple into the staged copy. */
+    uint64_t phys; uint32_t log2;
+    hlc_tick(ts, &phys, &log2);
+    uint32_t err = hlc_err_bound(ts);
+    memcpy(g_stamp_buf + 4 + ZMESG_OFF_HLC_PHYS, &phys, 8);
+    memcpy(g_stamp_buf + 4 + ZMESG_OFF_HLC_LOG, &log2, 4);
+    memcpy(g_stamp_buf + 4 + ZMESG_OFF_RING_ID, &g_hlc.ring_id, 8);
+    memcpy(g_stamp_buf + 4 + ZMESG_OFF_LOCAL_SEQ, &seq, 8);
+    memcpy(g_stamp_buf + 4 + ZMESG_OFF_ERR_BOUND, &err, 4);
+
+    /* BE frame length so the buffer doubles as a ready TCP frame. */
+    uint32_t net_len = htonl(len);
+    memcpy(g_stamp_buf, &net_len, 4);
+    g_hlc_stamped++;
+    return len;
+}
+
+/*
+ * hlc_init_from_env — read RING_ID and arm stamping. A decimal value
+ * is taken literally; anything else is FNV-1a-hashed so operators can
+ * write RING_ID=boat-7. Called after wal_init so a recovered
+ * (last_physical, last_logical) — see wal_scan_segment — is already
+ * in place and stamps can never regress across a restart.
+ */
+static void hlc_init_from_env(void) {
+    const char *v = getenv("RING_ID");
+    if (!v || !*v) return;
+    char *end = NULL;
+    uint64_t id = strtoull(v, &end, 10);
+    if (end && *end != '\0') id = fnv1a64(v);   /* not a number: hash  */
+    if (id == 0) return;                        /* 0 is "unstamped"    */
+    g_hlc.ring_id = id;
+    g_hlc.enabled = 1;
+    LOG_INFO("HLC stamping on: ring_id=%llu (RING_ID=%s) recovered "
+             "hlc=%llu.%u",
+             (unsigned long long)id, v,
+             (unsigned long long)g_hlc.last_physical, g_hlc.last_logical);
+}
+
 /*
  * ensure_dir — mkdir that treats "already exists" as success. Returns 0
  * if the directory exists (or was created), -1 on any other error.
@@ -627,6 +888,15 @@ static int wal_append(wal_t *w, const uint8_t *data, size_t len,
  *                 segment has no entries, this is the segment's base.
  *   out_count     set to the number of valid entries found.
  *
+ * HLC recovery side effect: if the LAST valid record's envelope is
+ * zmesg v2, its (hlc_physical_ns, hlc_logical) is adopted into g_hlc
+ * so stamps issued after a restart can never sort before stamps
+ * already on disk, even if the wall clock regressed while we were
+ * down. This is the identity rule from SPEC-hlc-envelope.md §7: a
+ * ring_id may only continue with its WAL-recovered state. One extra
+ * read of <= 98 bytes at startup; v1-only or empty segments leave
+ * g_hlc untouched.
+ *
  * Returns 0 on success, -1 if the file can't be opened or its header is
  * not a valid segment header.
  */
@@ -642,6 +912,8 @@ static int wal_scan_segment(const char *path, uint64_t *out_next_seq, uint64_t *
     uint64_t base = shdr.base_sequence;
     uint64_t count = 0;
     uint64_t last_seq = base; /* if no entries, "next" is base itself */
+    off_t    last_off = -1;   /* file offset of the last record's data */
+    uint32_t last_len = 0;
 
     for (;;) {
         wal_entry_hdr_t eh;
@@ -653,9 +925,26 @@ static int wal_scan_segment(const char *path, uint64_t *out_next_seq, uint64_t *
         /* Seek past the (padded) payload — the scan needs headers
          * only, so even large segments recover quickly. */
         size_t padded = (eh.data_len + (WAL_ALIGN - 1)) & ~((size_t)WAL_ALIGN - 1);
+        last_off = lseek(fd, 0, SEEK_CUR);     /* data starts here    */
+        last_len = eh.data_len;
         if (lseek(fd, (off_t)padded, SEEK_CUR) < 0) break;
         last_seq = eh.sequence;
         count++;
+    }
+
+    /* HLC recovery: re-read just the last envelope's fixed header and,
+     * if it is v2, adopt its clock so post-restart stamps continue
+     * monotonically from the durable history. */
+    if (count > 0 && last_off >= 0 && last_len >= ZMESG_FIXED_HDR_V2) {
+        uint8_t hdr[ZMESG_FIXED_HDR_V2];
+        if (pread(fd, hdr, sizeof hdr, last_off) == (ssize_t)sizeof hdr) {
+            uint32_t magic;
+            memcpy(&magic, hdr, 4);
+            if (magic == ZMESG_MAGIC && hdr[ZMESG_OFF_VERSION] == 2) {
+                memcpy(&g_hlc.last_physical, hdr + ZMESG_OFF_HLC_PHYS, 8);
+                memcpy(&g_hlc.last_logical, hdr + ZMESG_OFF_HLC_LOG, 4);
+            }
+        }
     }
     close(fd);
     *out_next_seq = last_seq + (count ? 1 : 0);
@@ -1382,6 +1671,7 @@ typedef struct shm_client {
 
     /* producer role (phase 5) */
     int           is_producer;
+    int           closing;      /* close deferred to end-of-batch  */
     shm_prod_ev_t prod_ev;
     uint64_t      prod_read;
     uint64_t      prod_msgs;
@@ -1446,6 +1736,33 @@ static void shm_prods_remove(shm_client_t *c) {
             return;
         }
     }
+}
+
+/*
+ * Deferred-close queue for SHM producers.
+ *
+ * A producer occupies TWO epoll registrations (handshake socket +
+ * ring eventfd), so one epoll_wait batch can contain events for
+ * both. Freeing the struct while the rest of the batch still holds
+ * a data.ptr into it would be a use-after-free — and a quick-exit
+ * producer (write tail, bump eventfd, close socket) makes that a
+ * coin flip. So the reactor never closes a producer mid-batch: it
+ * sets `closing`, queues it here, skips later events that resolve
+ * to a closing client, and runs the real closes after the batch.
+ * (Single-registration clients — TCP and SHM subscribers — still
+ * close inline; no other event in the batch can refer to them,
+ * except a TCP subscriber closed by fanout() on OOM: a pre-existing
+ * allocation-failure-only edge, accepted as-is.)
+ */
+static shm_client_t *g_shm_close_q[MAX_SHM_PRODS];
+static size_t g_shm_close_n = 0;
+
+/* shm_defer_close — mark + enqueue exactly once. */
+static void shm_defer_close(shm_client_t *c) {
+    if (c->closing) return;
+    c->closing = 1;
+    if (g_shm_close_n < MAX_SHM_PRODS)
+        g_shm_close_q[g_shm_close_n++] = c;
 }
 
 /*
@@ -1831,26 +2148,48 @@ static int handle_pub_data(client_t *c) {
             LOG_WARN("PUB %s envelope too short (%u)", c->peer, flen);
             /* still pass it through? no — strict protocol. drop frame. */
         } else {
-            /* Step 3: validate and route. Envelope begins at +4. */
+            /* Step 3: validate and route. Envelope begins at +4.
+             * Validation is version-aware: the topic sits after the
+             * fixed header, which is 66 (v1) or 98 (v2). */
             uint32_t magic;
             memcpy(&magic, c->rbuf + 4, 4);
             if (magic != ZMESG_MAGIC) {
                 LOG_WARN("PUB %s bad magic 0x%08x; closing", c->peer, magic);
                 return -1;
             }
+            uint8_t ver = c->rbuf[4 + ZMESG_OFF_VERSION];
             uint16_t topic_len;
             memcpy(&topic_len, c->rbuf + 4 + ZMESG_OFF_TOPIC_LEN, 2);
-            if ((uint32_t)ZMESG_FIXED_HDR + topic_len > flen) {
-                LOG_WARN("PUB %s topic_len %u exceeds frame %u",
-                         c->peer, topic_len, flen);
+            if (ver != 1 && ver != 2) {
+                LOG_WARN("PUB %s unknown zmesg version %u", c->peer, ver);
+            } else if (flen < zmesg_fixed_hdr(ver) ||
+                       zmesg_fixed_hdr(ver) + topic_len > flen) {
+                LOG_WARN("PUB %s v%u envelope inconsistent (len %u "
+                         "topic_len %u)", c->peer, ver, flen, topic_len);
             } else {
-                const char *topic = (const char *)(c->rbuf + 4 + ZMESG_FIXED_HDR);
                 /* Assign one sequence + timestamp shared by WAL and fan-out
                  * so observers across transports see the same identifiers. */
                 g_sequence++;
                 uint64_t seq = g_sequence;
                 uint64_t ts = now_ns_real();
-                wal_append(&g_wal, c->rbuf + 4, flen, ORIGIN_TCP, seq, ts);
+                /* HLC stamping may rewrite the envelope into
+                 * g_stamp_buf (v1 grows to v2); 0 means route the
+                 * original bytes. Stamp BEFORE the sinks so the WAL
+                 * stores exactly what subscribers see. */
+                const uint8_t *env = c->rbuf + 4;
+                uint32_t elen = flen;
+                const uint8_t *frame = c->rbuf;
+                size_t frame_len = 4 + flen;
+                if (g_hlc.enabled) {
+                    uint32_t sl = hlc_stamp_frame(env, flen, seq, ts);
+                    if (sl) {
+                        env = g_stamp_buf + 4; elen = sl;
+                        frame = g_stamp_buf;   frame_len = 4 + sl;
+                    }
+                }
+                const char *topic =
+                    (const char *)(env + zmesg_fixed_hdr(env[ZMESG_OFF_VERSION]));
+                wal_append(&g_wal, env, elen, ORIGIN_TCP, seq, ts);
                 /* SHM before TCP: the ring is the latency-critical
                  * tier (ns/us targets), while TCP subscribers queue
                  * through the kernel anyway. Ordering the ring write
@@ -1858,10 +2197,10 @@ static int handle_pub_data(client_t *c) {
                  * memcpys) out of the SHM hop. Measured 2026-06-11:
                  * with a "**" TCP sub attached, ring-hop p50 dropped
                  * from ~1.2 us to ~0.3 us after this swap. */
-                shm_fanout(c->rbuf + 4, flen, topic, topic_len, ORIGIN_TCP, seq, ts);
-                fanout(c->rbuf, 4 + flen, topic, topic_len);
+                shm_fanout(env, elen, topic, topic_len, ORIGIN_TCP, seq, ts);
+                fanout(frame, frame_len, topic, topic_len);
                 g_pub_msgs++;
-                g_pub_bytes += flen;
+                g_pub_bytes += elen;
             }
         }
         /* Step 4: slide any following bytes down and loop — the
@@ -1919,33 +2258,56 @@ static void udp_drain(int fd) {
             LOG_WARN("UDP bad magic 0x%08x", magic);
             continue;
         }
+        uint8_t ver = recv_buf[ZMESG_OFF_VERSION];
         uint16_t topic_len;
         memcpy(&topic_len, recv_buf + ZMESG_OFF_TOPIC_LEN, 2);
-        if ((uint32_t)ZMESG_FIXED_HDR + topic_len > (uint32_t)n) {
-            LOG_WARN("UDP topic_len %u exceeds datagram %zd", topic_len, n);
+        if (ver != 1 && ver != 2) {
+            LOG_WARN("UDP unknown zmesg version %u", ver);
             continue;
         }
-        const char *topic = (const char *)(recv_buf + ZMESG_FIXED_HDR);
+        if ((uint32_t)n < zmesg_fixed_hdr(ver) ||
+            zmesg_fixed_hdr(ver) + topic_len > (uint32_t)n) {
+            LOG_WARN("UDP v%u envelope inconsistent (len %zd topic_len %u)",
+                     ver, n, topic_len);
+            continue;
+        }
 
         /* Same one-identity rule as the TCP path: a single (seq, ts)
          * pair shared by the WAL, TCP fan-out, and SHM fan-out. */
         g_sequence++;
         uint64_t seq = g_sequence;
         uint64_t ts = now_ns_real();
-        wal_append(&g_wal, recv_buf, (size_t)n, ORIGIN_UDP, seq, ts);
+
+        /* HLC stamping, exactly as in handle_pub_data: a stamped copy
+         * lands in g_stamp_buf (already TCP-framed); 0 = original. */
+        const uint8_t *env = recv_buf;
+        size_t elen = (size_t)n;
+        const uint8_t *frame = NULL;
+        if (g_hlc.enabled) {
+            uint32_t sl = hlc_stamp_frame(env, (uint32_t)n, seq, ts);
+            if (sl) { env = g_stamp_buf + 4; elen = sl; frame = g_stamp_buf; }
+        }
+        const char *topic =
+            (const char *)(env + zmesg_fixed_hdr(env[ZMESG_OFF_VERSION]));
+
+        wal_append(&g_wal, env, elen, ORIGIN_UDP, seq, ts);
 
         /* SHM first — same latency-tiering as handle_pub_data. */
-        shm_fanout(recv_buf, (size_t)n, topic, topic_len, ORIGIN_UDP, seq, ts);
+        shm_fanout(env, elen, topic, topic_len, ORIGIN_UDP, seq, ts);
 
-        /* Re-frame for TCP fan-out: 4-byte BE length + datagram bytes. */
-        uint32_t net_len = htonl((uint32_t)n);
-        memcpy(tcp_frame, &net_len, 4);
-        memcpy(tcp_frame + 4, recv_buf, (size_t)n);
-        fanout(tcp_frame, 4 + (size_t)n, topic, topic_len);
+        /* TCP fan-out needs a length-prefixed frame: the stamp buffer
+         * already is one; otherwise re-frame the datagram here. */
+        if (!frame) {
+            uint32_t net_len = htonl((uint32_t)elen);
+            memcpy(tcp_frame, &net_len, 4);
+            memcpy(tcp_frame + 4, env, elen);
+            frame = tcp_frame;
+        }
+        fanout(frame, 4 + elen, topic, topic_len);
 
         g_pub_msgs++;
         g_udp_msgs++;
-        g_pub_bytes += (uint32_t)n;
+        g_pub_bytes += elen;
     }
 }
 
@@ -2040,35 +2402,60 @@ static void shm_producer_drain(shm_client_t *p) {
             const uint8_t *env = data + pos + sizeof eh;
             size_t env_len = eh.length;
 
-            /* Envelope validation — identical rules to udp_drain. */
+            /* Envelope validation — identical rules to udp_drain,
+             * version-aware like the other two ingest paths. */
             uint32_t magic = 0;
             uint16_t topic_len = 0;
+            uint8_t ver = 0;
             if (env_len >= ZMESG_FIXED_HDR) {
                 memcpy(&magic, env, 4);
+                ver = env[ZMESG_OFF_VERSION];
                 memcpy(&topic_len, env + ZMESG_OFF_TOPIC_LEN, 2);
             }
             if (env_len < ZMESG_FIXED_HDR || magic != ZMESG_MAGIC ||
-                (uint32_t)ZMESG_FIXED_HDR + topic_len > env_len) {
+                (ver != 1 && ver != 2) ||
+                env_len < zmesg_fixed_hdr(ver) ||
+                zmesg_fixed_hdr(ver) + topic_len > env_len) {
                 p->prod_bad++;                    /* skip just this   */
             } else {
-                const char *topic = (const char *)(env + ZMESG_FIXED_HDR);
-
                 /* One identity, standard sink order (WAL, SHM, TCP). */
                 g_sequence++;
                 uint64_t seq = g_sequence;
                 uint64_t ts = now_ns_real();
-                wal_append(&g_wal, env, env_len, ORIGIN_SHM, seq, ts);
-                shm_fanout(env, env_len, topic, topic_len,
+
+                /* HLC stamping. The ring bytes belong to the producer
+                 * (we only hold a read cursor over them), so a stamp
+                 * ALWAYS goes through the g_stamp_buf copy — never in
+                 * place. 0 = route the producer's bytes untouched. */
+                const uint8_t *renv = env;
+                size_t rlen = env_len;
+                const uint8_t *frame = NULL;
+                if (g_hlc.enabled) {
+                    uint32_t sl = hlc_stamp_frame(env, (uint32_t)env_len,
+                                                  seq, ts);
+                    if (sl) {
+                        renv = g_stamp_buf + 4; rlen = sl;
+                        frame = g_stamp_buf;
+                    }
+                }
+                const char *topic = (const char *)
+                    (renv + zmesg_fixed_hdr(renv[ZMESG_OFF_VERSION]));
+
+                wal_append(&g_wal, renv, rlen, ORIGIN_SHM, seq, ts);
+                shm_fanout(renv, rlen, topic, topic_len,
                            ORIGIN_SHM, seq, ts);
 
-                uint32_t net_len = htonl((uint32_t)env_len);
-                memcpy(tcp_frame, &net_len, 4);
-                memcpy(tcp_frame + 4, env, env_len);
-                fanout(tcp_frame, 4 + env_len, topic, topic_len);
+                if (!frame) {
+                    uint32_t net_len = htonl((uint32_t)rlen);
+                    memcpy(tcp_frame, &net_len, 4);
+                    memcpy(tcp_frame + 4, renv, rlen);
+                    frame = tcp_frame;
+                }
+                fanout(frame, 4 + rlen, topic, topic_len);
 
                 g_pub_msgs++;
                 g_shm_msgs++;
-                g_pub_bytes += env_len;
+                g_pub_bytes += rlen;
                 p->prod_msgs++;
             }
             p->prod_read += sizeof eh + padded;
@@ -2568,6 +2955,13 @@ int main(void) {
         LOG_WARN("WAL init failed; continuing without durability");
     }
 
+    /* HLC stamping (zmesg v2). Read AFTER wal_init so the recovered
+     * (last_physical, last_logical) from the WAL tail is already in
+     * g_hlc and post-restart stamps continue monotonically. Off
+     * unless RING_ID is set — the live single-ring broker is
+     * unaffected. */
+    hlc_init_from_env();
+
     /* Benchmark mode: busy-poll inbound SHM rings (see g_spin). */
     const char *spin = getenv("BROKER_SPIN");
     if (spin && *spin && *spin != '0') {
@@ -2575,10 +2969,28 @@ int main(void) {
         LOG_INFO("BROKER_SPIN on: busy-polling SHM producer rings");
     }
 
-    int pub_fd = listen_tcp(PUB_PORT);
-    int sub_fd = listen_tcp(SUB_PORT);
-    int udp_fd = bind_udp(UDP_PORT);
-    int shm_fd = bind_unix(SHM_PATH);
+    /* Port / socket overrides so several rings can run on one box
+     * (the distributed-disruptor Phase 0 needs >=2). PORT_BASE shifts
+     * the three consecutive ports together (pub, sub, udp); SHM_PATH
+     * relocates the Unix socket. Each ring also wants its own WAL_DIR
+     * and RING_ID. Defaults reproduce the historical 12001-3 layout. */
+    int port_base = PUB_PORT;
+    const char *pb = getenv("PORT_BASE");
+    if (pb && *pb) {
+        int v = atoi(pb);
+        if (v > 0 && v < 65533) port_base = v;
+        else LOG_WARN("PORT_BASE '%s' out of range; using %d", pb, port_base);
+    }
+    int pub_port = port_base;
+    int sub_port = port_base + 1;
+    int udp_port = port_base + 2;
+    const char *shm_path = getenv("SHM_PATH");
+    if (!shm_path || !*shm_path) shm_path = SHM_PATH;
+
+    int pub_fd = listen_tcp(pub_port);
+    int sub_fd = listen_tcp(sub_port);
+    int udp_fd = bind_udp(udp_port);
+    int shm_fd = bind_unix(shm_path);
     if (pub_fd < 0 || sub_fd < 0 || udp_fd < 0 || shm_fd < 0) return 1;
 
     g_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -2601,9 +3013,10 @@ int main(void) {
     ev.events = EPOLLIN; ev.data.ptr = &shm_ev;
     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, shm_fd, &ev);
 
-    LOG_INFO("planetar-broker phase-4 ready · PUB=%d SUB=%d UDP=%d SHM=%s · WAL=%s seq=%llu",
-             PUB_PORT, SUB_PORT, UDP_PORT, SHM_PATH,
-             g_wal.enabled ? wal_dir : "off", (unsigned long long)g_sequence);
+    LOG_INFO("planetar-broker phase-4 ready · PUB=%d SUB=%d UDP=%d SHM=%s · WAL=%s seq=%llu · HLC=%s",
+             pub_port, sub_port, udp_port, shm_path,
+             g_wal.enabled ? wal_dir : "off", (unsigned long long)g_sequence,
+             g_hlc.enabled ? "on" : "off");
 
     /* The reactor. The 1000 ms timeout exists only so a signal that
      * lands between events still stops us within a second. In spin
@@ -2627,8 +3040,11 @@ int main(void) {
             if (h->kind == EV_SHM_PROD_EV) {
                 /* A producer bumped its eventfd: clear the counter
                  * (its value is irrelevant — the ring's write_idx is
-                 * the source of truth) and drain the ring. */
+                 * the source of truth) and drain the ring. Skip if
+                 * the producer was queued for close earlier in this
+                 * same batch (its final drain happens at close). */
                 shm_client_t *p = ((shm_prod_ev_t *)h)->owner;
+                if (p->closing) continue;
                 uint64_t v;
                 ssize_t r = read(p->eventfd_fd, &v, sizeof v);
                 (void)r;
@@ -2637,10 +3053,16 @@ int main(void) {
             }
             if (h->kind == EV_SHM_CLIENT) {
                 shm_client_t *sc = (shm_client_t *)h;
+                if (sc->closing) continue;   /* already queued       */
                 int rc = 0;
                 if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) rc = -1;
                 if (rc == 0 && (events[i].events & EPOLLIN)) rc = shm_handle_handshake_data(sc);
-                if (rc < 0) shm_client_close(sc);
+                if (rc < 0) {
+                    /* Producers defer (two epoll registrations — see
+                     * g_shm_close_q); everyone else closes inline. */
+                    if (sc->is_producer) shm_defer_close(sc);
+                    else shm_client_close(sc);
+                }
                 continue;
             }
             /* Anything else is a TCP client. Error/hangup beats I/O;
@@ -2652,6 +3074,12 @@ int main(void) {
             if (rc == 0 && (events[i].events & EPOLLOUT)) rc = client_writable(c);
             if (rc < 0) client_close(c);
         }
+
+        /* End of batch: run the deferred producer closes. Each close
+         * drains the ring tail first, so a quick-exit producer's
+         * final messages still reach the WAL and fan-outs. */
+        while (g_shm_close_n > 0)
+            shm_client_close(g_shm_close_q[--g_shm_close_n]);
 
         /* Spin mode: poll every producer ring each iteration instead
          * of waiting for eventfd wakeups. Costs a no-op acquire-load
@@ -2666,14 +3094,22 @@ int main(void) {
              g_pub_msgs, g_pub_msgs - g_udp_msgs - g_shm_msgs,
              g_udp_msgs, g_shm_msgs,
              g_pub_bytes, g_delivered, (unsigned long long)g_sequence);
+    if (g_hlc.enabled)
+        LOG_INFO("HLC ring_id=%llu stamped=%llu observed=%llu oversize=%llu "
+                 "final=%llu.%u",
+                 (unsigned long long)g_hlc.ring_id, g_hlc_stamped,
+                 g_hlc_observed, g_hlc_oversize,
+                 (unsigned long long)g_hlc.last_physical, g_hlc.last_logical);
     wal_close(&g_wal);
     /* Best-effort cleanup before exit (the OS reclaims regardless).
-     * NOTE: each client_close() swap-compacts g_subs — an unvisited
-     * subscriber is swapped into the current slot and the forward
-     * loop then steps past it, so only about half get closed here.
-     * Harmless at exit; the SHM loop below shows the correct
-     * backward-iteration pattern. */
-    for (size_t i = 0; i < g_subs_count; i++) client_close(g_subs[i]);
+     * Iterate BACKWARD: client_close() swap-compacts g_subs, moving
+     * the last element into the freed slot, so a forward loop would
+     * step past every relocated entry and free only ~half. Walking
+     * down from the end visits each subscriber exactly once.
+     * (TCP *publishers* are not in any registry, so they are not
+     * freed here — a known, harmless shutdown-only gap; closing the
+     * listeners + exit drops their fds and the OS reclaims them.) */
+    for (size_t i = g_subs_count; i > 0; i--) client_close(g_subs[i - 1]);
     for (size_t i = g_shm_subs_count; i > 0; i--) shm_client_close(g_shm_subs[i - 1]);
     /* Producers last: their close path drains any unread ring tail
      * into the WAL/fan-out first (subscribers above are gone by now,
@@ -2683,7 +3119,7 @@ int main(void) {
     close(sub_fd);
     close(udp_fd);
     close(shm_fd);
-    unlink(SHM_PATH);
+    unlink(shm_path);
     close(g_epoll_fd);
     return 0;
 }

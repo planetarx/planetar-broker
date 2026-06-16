@@ -76,14 +76,31 @@ Full detail in `ARCH.md` §2–§8; the short list a future instance must not br
   first** in both structs.
 - **One identity per message.** `g_sequence++` and `now_ns_real()` are sampled
   once per accepted message, and the same `(seq, ts)` goes to `wal_append`,
-  `fanout` (TCP), and `shm_fanout` (SHM). Never re-sample per sink.
+  `fanout` (TCP), and `shm_fanout` (SHM). Never re-sample per sink. When HLC
+  stamping is on (`RING_ID` set), the single `hlc_tick()`/`hlc_stamp_frame()`
+  call is also part of that one-identity step — stamp once, before the sinks,
+  and route the stamped bytes (or the originals when it returns 0) to all three.
 - **Sink order is WAL → SHM → TCP** in both ingest paths (`handle_pub_data`,
   `udp_drain`). Durability first, then the latency-critical ring, then TCP
   queues — per-TCP-subscriber mallocs must stay out of the SHM hop (measured
   2026-06-11: ring-hop p50 0.3 µs vs 1.2 µs with a `**` TCP sub attached).
 - **Hardcoded zmesg offsets.** `ZMESG_FIXED_HDR=66`, `ZMESG_OFF_TOPIC_LEN=48`,
   magic `0x5A4D5347` are copies of `~/github/sness23/zmesg` — duplicated in
-  both `.c` files, no shared header. Change in lockstep.
+  both `.c` files plus `tests/zmesg-test.h`, no shared header. Change in
+  lockstep. **Two envelope versions now coexist on the wire:** v1 (fixed
+  header 66) and v2 (fixed header 98 — a 32-byte HLC sequencing extension at
+  offset 66, strings shifted to 98; see SPEC-hlc-envelope.md in
+  planetarx/planetar-disruptor). Every parse site branches on the version
+  byte (offset 4) via `zmesg_fixed_hdr()` to locate the topic; an unknown
+  version is dropped, not misparsed. `tests/zmesg-test.h` deliberately builds
+  v1 (producers stay v1; the broker upgrades to v2 at ingress).
+- **HLC stamping is opt-in and identity-recovering.** Off unless `RING_ID` is
+  set, so the live single-ring broker is byte-identical to before. When on,
+  the broker is the single writer of its ring and owns the v2 tuple
+  `(hlc_physical_ns, hlc_logical, ring_id, local_seq, err_bound_ns)`;
+  `wal_scan_segment` recovers `(last_physical, last_logical)` from the last v2
+  record so post-restart stamps never regress (SPEC §7 identity rule).
+  `PORT_BASE`/`SHM_PATH` env overrides let multiple rings run on one box.
 - **Duplicated twins.** `topic_matches`/`shm_topic_matches` and
   `parse_sub_line`/`parse_shm_sub_line` are identical logic on two struct
   types. Edit both or neither.
