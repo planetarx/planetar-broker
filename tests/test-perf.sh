@@ -37,8 +37,10 @@ cd "$(dirname "$0")/.."
 BROKER=./planetar-broker
 PUB_TCP=tests/pub-tcp
 PUB_UDP=tests/pub-udp
+PUB_SHM=tests/pub-shm
 SUB_TCP=tests/sub-tcp
 SUB_SHM=tests/sub-shm
+RING_HOP=tests/ring-hop
 
 N=${1:-100000}
 PAYLOAD=${2:-64}
@@ -57,7 +59,7 @@ port_open() {
     return 1
 }
 
-for bin in $BROKER $PUB_TCP $PUB_UDP $SUB_TCP $SUB_SHM; do
+for bin in $BROKER $PUB_TCP $PUB_UDP $PUB_SHM $SUB_TCP $SUB_SHM $RING_HOP; do
     [ -x "$bin" ] || { echo "missing $bin — run 'make test' first"; exit 1; }
 done
 if port_open 12001; then
@@ -155,14 +157,75 @@ run_path hop-wal-off \
     $SUB_SHM -b "$N" 10 "$PFX." "$PFX.hop0" -- \
     $PUB_TCP "$N" "$PFX.hop0" "$PAYLOAD" 5
 
+# --- SHM ingest end-to-end (phase 5): SHM producer -> broker -> SHM
+# consumer, NO kernel transport on either side. This is the full path
+# the proposal's flagship demo would use. Two configs:
+#   shm-shm-evented   default broker (WAL on, eventfd-driven): the
+#                     realistic out-of-the-box latency.
+#   shm-shm-spin      BROKER_SPIN=1 + WAL off + CPU pinning: the
+#                     best-case bus-core latency the architecture can
+#                     deliver through the broker today.
+# CPU pinning matters enormously for the spin path (a cross-core
+# cache-line handoff dominates), so pin broker/consumer/producer to
+# distinct cores when taskset is available.
+PIN_BRK=""; PIN_SUB=""; PIN_PUB=""
+if command -v taskset >/dev/null 2>&1; then
+    PIN_BRK="taskset -c 2"; PIN_SUB="taskset -c 4"; PIN_PUB="taskset -c 6"
+    echo "(CPU pinning: broker cpu2, consumer cpu4, producer cpu6)"
+fi
+
+echo "--- SHM INGEST e2e (SHM producer -> broker -> SHM consumer) ---"
+
+# shm-shm-evented: restart the broker at defaults (WAL on, evented).
+WAL_SHM=$(mktemp -d /tmp/planetar-perf-wal-XXXXXX)
+kill "$BROKER_PID" 2>/dev/null; wait "$BROKER_PID" 2>/dev/null
+WAL_DIR="$WAL_SHM" $BROKER >"$RESULTS/broker-shm-ev.log" 2>&1 &
+BROKER_PID=$!
+for _ in $(seq 1 50); do port_open 12001 && break; sleep 0.1; done
+run_path shm-shm-evented \
+    $SUB_SHM "$N" 10 "$PFX." "$PFX.ssev" -- \
+    $PUB_SHM "$N" "$PFX.ssev" "$PAYLOAD" 5
+
+# shm-shm-spin: restart with spin + WAL off, pinned, busy-poll sub.
+kill "$BROKER_PID" 2>/dev/null; wait "$BROKER_PID" 2>/dev/null
+WAL_DIR=/dev/null/x BROKER_SPIN=1 $PIN_BRK $BROKER \
+    >"$RESULTS/broker-shm-spin.log" 2>&1 &
+BROKER_PID=$!
+for _ in $(seq 1 50); do port_open 12001 && break; sleep 0.1; done
+echo "=== shm-shm-spin ==="
+timeout 120 $PIN_SUB $SUB_SHM -b "$N" 10 "$PFX." "$PFX.sssp" \
+    >"$RESULTS/shm-shm-spin.sub" 2>&1 &
+S=$!
+sleep 0.5
+timeout 120 $PIN_PUB $PUB_SHM "$N" "$PFX.sssp" "$PAYLOAD" 5 \
+    >"$RESULTS/shm-shm-spin.pub" 2>&1
+wait $S
+grep '^SENT'   "$RESULTS/shm-shm-spin.pub"
+grep '^RESULT' "$RESULTS/shm-shm-spin.sub"
+sed -n '/^Latency (e2e/,/Max:/p' "$RESULTS/shm-shm-spin.sub"
+echo
+
+# --- Direct ring hop (no broker): the zbroker0-topology measurement
+# on THIS codebase's ring algorithm. One producer process, one
+# busy-polling consumer process, distinct pinned cores, ns reported.
+# This is the apples-to-apples number against the proposal's headline.
+kill "$BROKER_PID" 2>/dev/null; wait "$BROKER_PID" 2>/dev/null
+echo "--- RING HOP direct (no broker, zbroker0 topology) ---"
+$RING_HOP "$N" "$PAYLOAD" 2 4 1
+
+echo
 echo "raw output in $RESULTS"
 echo
-echo "READING THE NUMBERS:"
-echo "  e2e blocks      full producer->consumer path (kernel ingest"
-echo "                  included): microsecond class by construction."
-echo "  ring-hop blocks bus core only. Compare hop-wal-off to the"
-echo "                  proposal's zbroker0 figure (p50 80-140 ns,"
-echo "                  direct ring hop) - but note that figure had"
-echo "                  no broker process between producer and ring."
-echo "                  A true apples-to-apples needs the planned"
-echo "                  SHM *producer* path."
+echo "READING THE NUMBERS (fastest layer first):"
+echo "  ring-hop direct   bus primitive, no broker (matches the"
+echo "                    proposal's zbroker0 topology): ns class."
+echo "  shm-shm-spin      through the broker, all shared memory,"
+echo "                    spin + WAL off: sub-microsecond e2e."
+echo "  shm-shm-evented   through the broker at defaults (WAL on,"
+echo "                    eventfd): the realistic out-of-box path."
+echo "  hop-* / e2e *     broker-internal ring hop reached via a"
+echo "                    kernel transport (TCP/UDP ingest): us class."
+echo
+echo "The proposal's p50 80-140 ns (zbroker0, 2026-04-27) is the"
+echo "ring-hop-direct row's analogue. The broker-in-path rows answer"
+echo "a different question (what a real client sees through the bus)."

@@ -14,8 +14,8 @@ file (`planetar-broker.c`) plus a ~220-line reference consumer (`shm-consumer.c`
  ─────────                      ───────────────                       ─────────
  TCP  ─frames─► :12001 ┐                                      ┌ :12002 ─frames─► TCP sub
  UDP  ─dgram──► :12003 ┼──►  single-threaded epoll reactor ──►┤
- (SHM producer: TODO)  ┘            │                         └ unix sock ─► SHM sub
-                                    ▼                                    (memfd ring
+ SHM  ─ring───► unix  ─┘            │                         └ unix sock ─► SHM sub
+       sock (PUB)                   ▼                                    (memfd ring
                                   WAL (./wal/, CRC32)                     + eventfd)
 ```
 
@@ -42,9 +42,23 @@ libraries.
 ```bash
 ./planetar-broker                 # WAL in ./wal/
 WAL_DIR=/var/lib/planetar ./planetar-broker   # WAL elsewhere
+
+# A second, isolated ring on one box (distributed-disruptor Phase 0):
+PORT_BASE=12101 SHM_PATH=/tmp/pb-b.sock WAL_DIR=/tmp/wal-b \
+  RING_ID=ring-b ./planetar-broker
 ```
 
-Ports and endpoints (all loopback-only by design):
+Environment:
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `WAL_DIR` | `./wal` | WAL segment directory |
+| `PORT_BASE` | `12001` | TCP pub = base, TCP sub = base+1, UDP = base+2 |
+| `SHM_PATH` | `/tmp/planetar-broker.sock` | Unix handshake socket |
+| `RING_ID` | *(unset)* | Enables HLC v2 stamping; a decimal id or any string (FNV-1a hashed). Unset = pass envelopes through unstamped, identical to before. See `planetarx/planetar-disruptor/SPEC-hlc-envelope.md`. |
+| `BROKER_SPIN` | *(unset)* | Busy-poll inbound SHM rings (benchmark mode) |
+
+Ports and endpoints below assume the default `PORT_BASE` (all loopback-only by design):
 
 | Endpoint                      | Role                                   |
 |-------------------------------|----------------------------------------|
@@ -94,11 +108,21 @@ Topics match three ways: exact string, a single trailing `.*` prefix wildcard
 datagram boundary frames it). Re-framed to length-prefixed form for TCP
 subscribers; delivered raw to SHM subscribers.
 
-**SHM (`/tmp/planetar-broker.sock`).** Connect, send the same `SUB ...\n` line,
-then receive two file descriptors via `SCM_RIGHTS`: a 16 MiB ring `memfd` and an
-`eventfd`. The broker writes entries into the ring and signals the eventfd; the
-consumer blocks on the eventfd and drains the ring. `shm-consumer.c` is the
-canonical reader — see it for the exact ring-walking logic.
+**SHM subscribe (`/tmp/planetar-broker.sock`).** Connect, send the same
+`SUB ...\n` line, then receive two file descriptors via `SCM_RIGHTS`: a 16 MiB
+ring `memfd` and an `eventfd`. The broker writes entries into the ring and
+signals the eventfd; the consumer blocks on the eventfd and drains the ring.
+`shm-consumer.c` is the canonical reader — see it for the exact ring-walking
+logic.
+
+**SHM publish (`/tmp/planetar-broker.sock`).** Connect and send `PUB\n` instead;
+the broker hands back an *inbound* ring `memfd` + `eventfd` the same way, but now
+the **producer** writes entries and bumps the eventfd, and the broker drains and
+routes them (origin `ORIGIN_SHM`). Inbound rings have flow control — the broker
+publishes its read cursor in the ring header so a producer never overwrites
+unread bytes (ingest must not lose data). This is the no-kernel-transport
+ingest path; `tests/pub-shm.c` is the canonical writer. Run the broker with
+`BROKER_SPIN=1` to busy-poll producer rings for lowest ingest latency.
 
 The envelope itself is the external **zmesg** format; the broker reads only its
 fixed header (magic, topic offset/length) for routing and never parses payloads.
@@ -136,10 +160,11 @@ make perf N=1000000   # proposal-grade run
 
 | Piece | What it covers |
 |---|---|
-| `tests/test-unit.c` | ~180 checks against the broker's internals — it `#include`s `planetar-broker.c` (main renamed) so every static function is testable: CRC32 vectors, SUB-line parsing, topic matching, buffer growth, drop-oldest queues, partial-write resume, WAL roundtrip/recovery/torn-tail, SHM ring writes across the wrap sentinel, EOF-flush + burst-backlog regressions |
-| `tests/test-functional.sh` | 16 scenarios against a live broker: handshake accept/reject, exact/wildcard/`**` routing, multi-sub fan-out, all four cross-transport paths, protocol-violation survival, backpressure drops, WAL recovery across restart |
-| `tests/test-perf.sh` | unpaced burst throughput + paced per-message latency (p50/p90/p99) for TCP→TCP, TCP→SHM, UDP→SHM |
-| `tests/pub-tcp`, `pub-udp`, `sub-tcp`, `sub-shm` | standalone protocol clients the scripts drive; also useful interactively |
+| `tests/test-unit.c` | ~198 checks against the broker's internals — it `#include`s `planetar-broker.c` (main renamed) so every static function is testable: CRC32 vectors, SUB-line parsing, topic matching, buffer growth, drop-oldest queues, partial-write resume, WAL roundtrip/recovery/torn-tail, SHM ring writes across the wrap sentinel, **SHM producer drain (skip/resync/flow-control)**, EOF-flush + burst-backlog regressions |
+| `tests/test-functional.sh` | 19 scenarios against a live broker: handshake accept/reject, exact/wildcard/`**` routing, multi-sub fan-out, all four cross-transport paths **including SHM-producer → SHM/TCP**, protocol-violation survival, backpressure drops, WAL recovery across restart |
+| `tests/test-perf.sh` | burst throughput + paced latency (p50/p90/p99) for every path, plus the **`ring-hop` direct primitive bench** and **SHM-producer e2e** (spin / evented) |
+| `tests/pub-tcp`, `pub-udp`, `pub-shm`, `sub-tcp`, `sub-shm` | standalone protocol clients the scripts drive; also useful interactively |
+| `tests/ring-hop` | standalone two-process SHM ring benchmark (no broker) — the ns-class primitive measurement |
 | `tests/zmesg-test.h`, `tests/latency-stats.h` | envelope builder/parser (mirrors `zmesg.h`) and the qsort-percentile stats ported from zbroker0 |
 
 **Live-host coexistence:** on a dev box the pm2 fleet (`planetar-ais`
@@ -149,23 +174,28 @@ therefore publishes under a unique per-run topic prefix and the consumers count
 only that prefix, so live traffic can't corrupt results. The suite aborts only
 if another *broker* already holds port 12001.
 
-Representative numbers from this suite (i9-9900K, 64 B payloads, 20 k msgs,
-2026-06-11): burst ingest ≈ **1.2 M msg/s** with 100 % SHM delivery; paced
-e2e latency p50 ≈ **34 µs** (TCP→TCP), **26 µs** (TCP→SHM), **17 µs**
-(UDP→SHM); **broker ring hop** (accept stamp → busy-polling SHM consumer,
-the `hop-*` passes in `make perf`) p50 ≈ **1.8–2.0 µs** WAL-on,
-**≈ 300 ns** WAL-off (Min ≈ 140–160 ns).
+Representative numbers (i9-9900K, 64 B payloads):
+
+- **Ring primitive — the nanosecond target.** `tests/ring-hop` (1 M msgs,
+  pinned cores, the zbroker0 single-hop topology on *this* codebase's ring
+  contract, no broker in the path): Min ≈ **47 ns**, **p50 ≈ 95 ns**, p90 ≈
+  130 ns. Inside the proposal's **80–140 ns** band.
+- **Through the broker, all shared memory** (SHM producer → broker → SHM
+  consumer, `make perf` `shm-shm-*`): e2e p50 ≈ **0.6 µs** spin + WAL-off,
+  ≈ **7 µs** evented + WAL-on (the realistic out-of-box default).
+- **Kernel-transport ingest** (paced, `make perf`): e2e p50 ≈ **34 µs**
+  (TCP→TCP), **26 µs** (TCP→SHM), **17 µs** (UDP→SHM); burst throughput
+  ≈ **1.2 M msg/s** with 100 % SHM delivery.
 
 > **Benchmark provenance.** The proposal's headline **p50 80–140 ns / p99
 > 400–900 ns** (zbroker0, 2026-04-27) measured a *direct SHM-producer → ring →
-> consumer hop* with no broker process in between. planetar-broker's closest
-> in-architecture analogue is the ring-hop number above: its WAL-off p50 of
-> ~300 ns is the bus core (stamp + topic match + ring write + cross-process
-> visibility, including ~50–100 ns of measurement overhead from the two
-> `clock_gettime` calls). The full e2e paths cross a kernel transport into
-> the broker and are microsecond-class by construction. A true
-> apples-to-apples with the zbroker0 figure requires the planned SHM
-> *producer* path. Different measurements; don't conflate them. Likewise the
+> consumer hop* with no broker process between. With the SHM producer path
+> (phase 5, 2026-06-14) that topology is now reproducible on planetar-broker's
+> own ring code via `tests/ring-hop` — the **p50 ≈ 95 ns** above is the
+> apples-to-apples figure and it lands in the target band. The
+> through-broker rows answer a different question (what a real client sees
+> across the bus: a second ring hop, routing, optional WAL/eventfd) and are
+> sub-µs to µs by construction — don't conflate the two. Likewise the
 > browser/WebSocket tooling in `~/github/sness23/sales4` measures the *UI
 > bridge*, not the C bus.
 

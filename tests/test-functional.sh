@@ -28,6 +28,9 @@
 #   I2   TCP pub -> SHM sub
 #   I3   UDP pub -> SHM sub
 #   I4   TCP + SHM subscribers see the same message count
+#   I7   SHM producer -> SHM sub (all-shared-memory path)
+#   I8   SHM producer -> TCP sub (ingest crosses to kernel transport)
+#   I9   broker logs clean producer accounting at disconnect
 #   I5   oversized frame -> publisher dropped, broker survives
 #   I6   slow consumer -> drop-oldest backpressure engages
 #   W1   WAL: clean restart recovers the sequence (no id reuse)
@@ -40,6 +43,7 @@ cd "$(dirname "$0")/.."          # repo root
 BROKER=./planetar-broker
 PUB_TCP=tests/pub-tcp
 PUB_UDP=tests/pub-udp
+PUB_SHM=tests/pub-shm
 SUB_TCP=tests/sub-tcp
 SUB_SHM=tests/sub-shm
 
@@ -99,7 +103,7 @@ stop_broker() {
 say "planetar-broker functional tests"
 say "results dir: $RESULTS    topic prefix: $PFX"
 
-for bin in $BROKER $PUB_TCP $PUB_UDP $SUB_TCP $SUB_SHM; do
+for bin in $BROKER $PUB_TCP $PUB_UDP $PUB_SHM $SUB_TCP $SUB_SHM; do
     [ -x "$bin" ] || { say "missing $bin — run 'make test' to build"; exit 1; }
 done
 
@@ -201,6 +205,28 @@ $PUB_TCP 60 "$PFX.both" >>"$RESULTS/i4.out" 2>&1
 wait $SA; RA=$?
 wait $SB; RB=$?
 check "I4 TCP and SHM both get 60/60" test $RA -eq 0 -a $RB -eq 0
+
+# ---------------- I7-I9: SHM producer ingest (phase 5) -----------
+say "-- SHM producer ingest"
+
+# I7: SHM in -> SHM out (the all-shared-memory path).
+timeout 20 $SUB_SHM 100 5 "$PFX." "$PFX.sps" >"$RESULTS/i7.out" 2>&1 &
+S=$!; sleep 0.3
+$PUB_SHM 100 "$PFX.sps" 64 50 >>"$RESULTS/i7.out" 2>&1
+wait $S; check "I7 SHM -> SHM, 100/100" test $? -eq 0
+
+# I8: SHM in -> TCP out (ingest crosses to a kernel-transport sub).
+timeout 20 $SUB_TCP 100 5 0 "$PFX." "$PFX.spt" >"$RESULTS/i8.out" 2>&1 &
+S=$!; sleep 0.3
+$PUB_SHM 100 "$PFX.spt" 64 50 >>"$RESULTS/i8.out" 2>&1
+wait $S; check "I8 SHM -> TCP, 100/100" test $? -eq 0
+
+# I9: the broker logs clean producer accounting at disconnect
+# (msgs delivered, zero bad envelopes, zero flow-control resyncs).
+grep -Eq "disconnect SHM PUB .*msgs=100 bad=0 resyncs=0" \
+     "$RESULTS/broker-a.log"
+check "I9 producer disconnect clean (msgs=100 bad=0 resyncs=0)" \
+      test $? -eq 0
 
 # ---------------- I5: protocol violation ----------------
 say "-- protocol violations"

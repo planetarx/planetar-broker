@@ -496,13 +496,118 @@ skipped.)
 
 ---
 
+## 7b. Inbound rings: the SHM producer path (phase 5)
+
+Phase 5 reverses the ring for *producers*. A client connects to the same Unix
+socket and sends `PUB\n` (instead of `SUB ...`); the broker stands up an
+**inbound** ring and now *reads* it. Same 64-byte header, same 24-byte entry
+header, same length-0 wrap sentinel, same release/acquire publication — only the
+roles flip: the client writes and release-stores `write_idx`, the broker
+acquire-loads and drains. This is the path that lets a producer reach the bus
+with no kernel transport on the data plane at all.
+
+### 7b.1 Why inbound rings need flow control
+
+Outbound rings are newest-wins (§7.5): a slow *subscriber* losing stale frames is
+fine. Ingest is the opposite — a dropped message there silently bypasses the WAL,
+so loss is unacceptable. The broker therefore publishes its read cursor back to
+the producer in the header's `reserved[0]`:
+
+```c
+/* after draining a batch, in shm_producer_drain() */
+__atomic_store_n(&hdr->reserved[0], p->prod_read, __ATOMIC_RELEASE);
+```
+
+and the producer must never let `write_idx` run more than `RING_DATA_SIZE` ahead
+of that cursor. `pub-shm` spins (bounded) when the ring is full rather than
+overwrite unread bytes. The release-store pairs with the producer's acquire-load
+the same way `write_idx` does in the other direction — a two-cursor SPSC ring,
+one cursor owned by each side.
+
+### 7b.2 Draining and error containment
+
+`shm_producer_drain` is the third ingest pump, a sibling to `handle_pub_data`
+(TCP) and `udp_drain` (UDP). Each valid envelope gets the standard treatment —
+one fresh `(sequence, timestamp)`, then the WAL → SHM → TCP sink order — with
+origin `ORIGIN_SHM`. Containment is graded by how much it can trust:
+
+| Failure | Trust | Action |
+|---|---|---|
+| bad envelope (magic / topic bounds) | entry header still valid | skip one entry, `prod_bad++` |
+| insane entry header (`length > FRAME_MAX_LEN`, crosses end-of-ring) | framing is lost | resync cursor to `write_idx`, `prod_resyncs++` |
+| lapped (`write_idx − cursor > RING_DATA_SIZE`) | bytes already overwritten | same resync |
+
+A single corrupt message never desyncs the stream; only a framing failure forces
+a (logged, counted) resync.
+
+### 7b.3 Two epoll registrations, one deferred close
+
+A producer owns **two** fds in the epoll set: its handshake socket (for hangup
+detection) and its ring eventfd (its publish wakeups). One `epoll_wait` batch can
+carry events for both, so closing the client inline when the socket reports
+hangup would leave a dangling `data.ptr` for the eventfd event later in the same
+batch — a use-after-free that a quick-exit producer (write tail, bump, close)
+hits reliably. The reactor instead **defers** producer closes: it sets `closing`,
+queues the client, skips any later same-batch event that resolves to a closing
+client, and runs the real closes after the batch. The close path drains the ring
+tail first (the SHM mirror of the TCP EOF-flush rule), so a producer's last
+messages still reach the WAL and fan-outs. (Validated under ASan: no
+use-after-free across repeated quick-exit producers.)
+
+### 7b.4 Benchmark mode (`BROKER_SPIN=1`)
+
+Evented ingest pays an eventfd wakeup (~µs) per batch. With `BROKER_SPIN=1` and at
+least one producer attached, the reactor drops its epoll timeout to zero and
+busy-polls every producer ring each iteration — trading a pegged core for the
+removal of that wakeup. With no producers attached it falls back to normal
+blocking, so the flag is free on a mostly-TCP broker.
+
+### 7b.5 Where the nanoseconds landed
+
+The ring algorithm itself, measured in the zbroker0 single-hop topology (one
+writer process, one busy-polling reader process, distinct pinned cores, via
+`tests/ring-hop` which uses *this* codebase's ring contract with no broker in the
+path):
+
+| Metric | 1 M msgs, 64 B, pinned (i9-9900K, 2026-06-14) |
+|---|---|
+| Min | ~47–54 ns |
+| **p50** | **~94–97 ns** |
+| p90 | ~130–133 ns |
+| p99 | ~0.9–1.1 µs |
+
+That p50 sits squarely inside the proposal's **80–140 ns** target band — the
+number is now planetar-broker's *own* ring code, not an inherited zbroker0 figure.
+
+End-to-end *through the broker* (SHM producer → broker → SHM consumer,
+`tests/test-perf.sh`'s `shm-shm-*` passes) costs more because a real message
+crosses two ring hops plus the broker's accept/route work:
+
+| Config | e2e p50 |
+|---|---|
+| `shm-shm-spin` (WAL off, pinned, busy-poll) | ~0.6 µs |
+| `shm-shm-evented` (default: WAL on, eventfd) | ~7 µs |
+
+The gap from 95 ns to ~0.6 µs is the second ring hop plus the broker's per-message
+routing (sequence, WAL-disabled no-op, fan-out scans); the gap to ~7 µs is the
+eventfd wakeups and the WAL `writev`. All three numbers are real and answer
+different questions: the ring primitive, the spun bus core, and the realistic
+out-of-box path.
+
+---
+
 ## 8. Backpressure, end to end
 
-| Sink            | Policy                          | Mechanism                       |
+| Sink / source   | Policy                          | Mechanism                       |
 |-----------------|---------------------------------|---------------------------------|
 | TCP subscriber  | drop **oldest** queued frames   | `outq_push` evicts from head    |
 | SHM subscriber  | overwrite **oldest** ring bytes | reader's unread data is clobbered |
+| SHM **producer**| **block** the producer (no loss) | reader cursor in `reserved[0]`; producer waits (§7b.1) |
 | WAL             | disable on write error          | `w->enabled = 0`, keep serving  |
+
+Note the SHM producer is the one place the *other* party blocks rather than the
+broker: ingest loss bypasses durability, so here back-pressure pushes upstream
+instead of dropping. The broker reactor itself still never blocks.
 
 The TCP queue cap is `OUTQ_MAX_BYTES` (1 MiB) per subscriber. `outq_push`:
 
