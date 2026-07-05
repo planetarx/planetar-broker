@@ -7,10 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `planetar-broker` is a single-file C message bus (`planetar-broker.c`, ~2.1 k
 lines, roughly half doc comments) plus a ~220-LOC reference SHM consumer
 (`shm-consumer.c`). It is the "Bus" component of the planetar / IDEaS CH13
-proposal spine. The parent workspace's `CLAUDE.md` (`~/github/planetarx/CLAUDE.md`)
-lists this directory as an "empty placeholder" — that is stale; the real broker
-source lives here. Proposal claims that cite LOC or benchmarks should be verified
+proposal spine. Proposal claims that cite LOC or benchmarks should be verified
 against this repo.
+
+On the deploy box (bb) the broker runs under pm2 as `planetar:broker`
+(WAL in this repo's `./wal`) — never run a bare `./planetar-broker` to test:
+it ignores argv and binds the live ports; use `PORT_BASE`/`SHM_PATH`/`WAL_DIR`
+overrides (see `~/data/vaults/docs/DEPLOY-planetar.md`).
 
 It carries zmesg envelopes over four transports simultaneously (TCP pub :12001,
 TCP sub :12002, UDP :12003, SHM via `/tmp/planetar-broker.sock`) and durably
