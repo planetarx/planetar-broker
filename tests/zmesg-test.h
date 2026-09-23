@@ -111,7 +111,7 @@ static inline int zt_build(uint8_t *buf, size_t cap,
 
     memcpy(buf + ZT_FIXED_HDR, topic, topic_len);
     if (payload_len)
-        memcpy(buf + ZT_FIXED_HDR + topic_len, payload, payload_len);
+        memmove(buf + ZT_FIXED_HDR + topic_len, payload, payload_len);
     return (int)total;
 }
 
