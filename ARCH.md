@@ -285,6 +285,18 @@ typedef struct {
 The structs are `packed` so the byte offsets are exact and stable — external
 replay tooling can read entries by offset.
 
+### 6.1a Retention
+
+`WAL_MAX_BYTES` (env; default 4 GiB; `0` = unbounded) caps the directory.
+`wal_prune` lists `segment-*.wal`, sorts by base id, and unlinks oldest-first
+until the total fits, never touching the active segment. It runs in two
+places: at the end of `wal_init`, before the reactor exists, so a months-old
+backlog is deleted without stalling traffic; and in `wal_append` right after a
+rotation, where steady state is one unlink per 64 MiB written. A failed unlink
+is a warning, not a WAL-disable — retention is best-effort. Recovery is
+unaffected: `wal_init` reads only the highest segment and pruning only ever
+removes the lowest.
+
 ### 6.2 The append hot path
 
 One `writev` puts header + envelope + pad on disk in a single syscall, so a record

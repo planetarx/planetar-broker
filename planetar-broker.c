@@ -72,6 +72,9 @@
  * On startup the broker scans WAL_DIR, finds the latest segment, walks its
  * entries to recover the next sequence number, then opens a fresh segment.
  * CRC32 uses the standard IEEE polynomial 0xEDB88320, computed over data.
+ * Retention: WAL_MAX_BYTES (env, default 4G, 0 = unbounded) caps the
+ * directory; at startup and after every rotation the oldest segments are
+ * unlinked until the total fits. The active segment is never removed.
  */
 
 /*
@@ -228,6 +231,7 @@ static inline uint32_t zmesg_fixed_hdr(uint8_t ver) {
 /* WAL constants — see the WAL section for the formats they govern. */
 #define WAL_DIR_DEFAULT      "./wal"        /* env WAL_DIR overrides  */
 #define WAL_SEG_MAX_BYTES    (64u * 1024 * 1024)    /* 64 MiB per segment */
+#define WAL_MAX_BYTES_DEFAULT (4ull << 30)  /* env WAL_MAX_BYTES; 0=off */
 #define WAL_ENTRY_MAGIC      0xB10Cu        /* per-record sync marker */
 #define WAL_SEG_MAGIC        0x57414C31u             /* "WAL1" */
 #define WAL_SEG_VERSION      1u             /* on-disk format version */
@@ -429,6 +433,10 @@ typedef struct {
 } wal_t;
 
 static wal_t g_wal;          /* the single active WAL */
+
+/* Retention cap for the whole WAL directory, from WAL_MAX_BYTES (see
+ * wal_parse_max_bytes / wal_prune). 0 disables pruning entirely. */
+static uint64_t g_wal_max_bytes = WAL_MAX_BYTES_DEFAULT;
 
 /*
  * g_sequence — the broker-wide monotonic message counter. Pre-incremented
@@ -790,6 +798,123 @@ static void wal_finalize_segment(wal_t *w) {
 }
 
 /*
+ * wal_parse_max_bytes — parse a WAL_MAX_BYTES value: a non-negative
+ * decimal byte count with an optional binary suffix K, M or G (either
+ * case), e.g. "0", "4096", "512M", "4G". Anything else — empty string,
+ * a sign, a trailing "B", non-digits — is rejected so a typo cannot
+ * silently mean "unbounded".
+ *
+ * On success stores the byte count in *out and returns 0; returns -1
+ * on a malformed value (and leaves *out untouched).
+ */
+static int wal_parse_max_bytes(const char *s, uint64_t *out) {
+    if (!s || !*s || *s < '0' || *s > '9') return -1;
+    uint64_t v = 0;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (uint64_t)(*p - '0');
+        p++;
+    }
+    unsigned shift = 0;
+    if (*p == 'K' || *p == 'k') { shift = 10; p++; }
+    else if (*p == 'M' || *p == 'm') { shift = 20; p++; }
+    else if (*p == 'G' || *p == 'g') { shift = 30; p++; }
+    if (*p) return -1;                 /* trailing junk */
+    *out = v << shift;
+    return 0;
+}
+
+/* One row of the segment listing wal_prune builds before deciding. */
+typedef struct {
+    uint64_t base;      /* base sequence id, parsed from the filename */
+    uint64_t size;      /* on-disk size in bytes */
+} wal_seg_info_t;
+
+/* qsort comparator: oldest segment (lowest base) first. */
+static int wal_seg_info_cmp(const void *a, const void *b) {
+    const wal_seg_info_t *x = a, *y = b;
+    return x->base < y->base ? -1 : x->base > y->base ? 1 : 0;
+}
+
+/*
+ * wal_prune — enforce the WAL_MAX_BYTES retention cap by unlinking the
+ * oldest segments in `w->dir` until the directory's segment bytes fit
+ * under `max_bytes`. The active segment (base == w->base_sequence) is
+ * never unlinked, even when it alone exceeds the cap, so the sequence
+ * recovery in wal_init always finds the newest file. Files that don't
+ * match "segment-<base>.wal" are ignored. `max_bytes == 0` means
+ * unbounded and returns immediately.
+ *
+ * Called from wal_init (once, before the reactor runs — the one place a
+ * large backlog may be deleted) and from wal_append after a rotation
+ * (steady state: one unlink per 64 MiB written, well under a
+ * millisecond, so the reactor is never meaningfully blocked).
+ *
+ * A failed unlink is logged and skipped — retention is best-effort and
+ * must never disable the WAL or stop the broker.
+ *
+ * Returns the number of segments removed, or -1 if the directory could
+ * not be listed.
+ */
+static int wal_prune(wal_t *w, uint64_t max_bytes) {
+    if (max_bytes == 0) return 0;
+
+    DIR *d = opendir(w->dir);
+    if (!d) {
+        LOG_WARN("WAL prune: opendir %s: %s", w->dir, strerror(errno));
+        return -1;
+    }
+    wal_seg_info_t *segs = NULL;
+    size_t n = 0, cap = 0;
+    uint64_t total = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        unsigned long long base = 0;
+        if (sscanf(de->d_name, "segment-%llu.wal", &base) != 1) continue;
+        char path[512];
+        wal_segment_path(path, sizeof path, w->dir, base);
+        struct stat st;
+        if (stat(path, &st) < 0) continue;
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 64;
+            wal_seg_info_t *grown = realloc(segs, ncap * sizeof *segs);
+            if (!grown) {
+                LOG_WARN("WAL prune: out of memory listing %s", w->dir);
+                free(segs);
+                closedir(d);
+                return -1;
+            }
+            segs = grown;
+            cap = ncap;
+        }
+        segs[n].base = base;
+        segs[n].size = (uint64_t)st.st_size;
+        total += segs[n].size;
+        n++;
+    }
+    closedir(d);
+    qsort(segs, n, sizeof *segs, wal_seg_info_cmp);
+
+    int removed = 0;
+    for (size_t i = 0; i < n && total > max_bytes; i++) {
+        if (segs[i].base == w->base_sequence) continue;   /* immortal */
+        char path[512];
+        wal_segment_path(path, sizeof path, w->dir, segs[i].base);
+        if (unlink(path) < 0) {
+            LOG_WARN("WAL prune: unlink %s: %s", path, strerror(errno));
+            continue;
+        }
+        total -= segs[i].size;
+        removed++;
+        LOG_INFO("WAL pruned %s (%llu bytes; %llu bytes remain, cap %llu)",
+                 path, (unsigned long long)segs[i].size,
+                 (unsigned long long)total, (unsigned long long)max_bytes);
+    }
+    free(segs);
+    return removed;
+}
+
+/*
  * wal_append — append one envelope to the log. The single durability
  * hook on the message hot path; called for every accepted message just
  * before fan-out.
@@ -833,6 +958,7 @@ static int wal_append(wal_t *w, const uint8_t *data, size_t len,
             w->enabled = 0;
             return -1;
         }
+        wal_prune(w, g_wal_max_bytes);   /* retention; best-effort */
     }
 
     wal_entry_hdr_t hdr = {0};
@@ -1019,6 +1145,11 @@ static int wal_init(wal_t *w, const char *dir) {
         w->enabled = 0;
         return -1;
     }
+    /* Retention runs here, before the reactor exists, so a large backlog
+     * (a box that ran unbounded for months) is deleted without ever
+     * stalling live traffic. */
+    int pruned = wal_prune(w, g_wal_max_bytes);
+    if (pruned > 0) LOG_INFO("WAL retention: removed %d old segment(s)", pruned);
     return 0;
 }
 
@@ -2951,6 +3082,15 @@ int main(void) {
 
     const char *wal_dir = getenv("WAL_DIR");
     if (!wal_dir || !*wal_dir) wal_dir = WAL_DIR_DEFAULT;
+    /* Retention cap. Parsed before wal_init because wal_init prunes. A
+     * malformed value keeps the default rather than silently unbounding. */
+    const char *wmb = getenv("WAL_MAX_BYTES");
+    if (wmb && *wmb) {
+        if (wal_parse_max_bytes(wmb, &g_wal_max_bytes) < 0)
+            LOG_WARN("WAL_MAX_BYTES '%s' malformed; using default %llu",
+                     wmb, (unsigned long long)g_wal_max_bytes);
+    }
+    if (g_wal_max_bytes == 0) LOG_INFO("WAL retention off (WAL_MAX_BYTES=0)");
     if (wal_init(&g_wal, wal_dir) < 0) {
         LOG_WARN("WAL init failed; continuing without durability");
     }

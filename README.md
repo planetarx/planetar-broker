@@ -53,6 +53,7 @@ Environment:
 | Var | Default | Effect |
 |-----|---------|--------|
 | `WAL_DIR` | `./wal` | WAL segment directory |
+| `WAL_MAX_BYTES` | `4G` | Retention cap for the WAL directory; oldest segments are unlinked at startup and after each rotation until the total fits. Plain bytes or `K`/`M`/`G`. `0` = unbounded. The active segment is never removed. |
 | `PORT_BASE` | `12001` | TCP pub = base, TCP sub = base+1, UDP = base+2 |
 | `SHM_PATH` | `/tmp/planetar-broker.sock` | Unix handshake socket |
 | `RING_ID` | *(unset)* | Enables HLC v2 stamping; a decimal id or any string (FNV-1a hashed). Unset = pass envelopes through unstamped, identical to before. See `planetarx/planetar-disruptor/SPEC-hlc-envelope.md`. |
@@ -144,6 +145,12 @@ Before fan-out, every valid envelope is appended to a 64 MiB segment file under
 broker scans the latest segment, walks its entries to recover the next sequence
 number, and opens a fresh segment. Segment files (`segment-<base>.wal`) are
 gitignored. See `ARCH.md` for the on-disk format.
+
+Retention is bounded by `WAL_MAX_BYTES` (default 4 GiB, about 64 segments):
+at startup and after every rotation the oldest segments are unlinked until the
+directory fits. Set `0` to keep everything. Before this cap existed (added
+2026-09-23) a broker left running grew its WAL by roughly a segment every few
+hours indefinitely; bb reached 68 GB.
 
 ## Testing
 

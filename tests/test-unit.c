@@ -19,6 +19,9 @@
  *   8. WAL append -> scan -> recover roundtrip, torn-tail stop,
  *      and the +1,000,000 anti-collision jump on a bad header
  *   9. SHM ring write + wrap-sentinel walk (a simulated live reader)
+ *  10. wal_prune retention: oldest-first deletion under WAL_MAX_BYTES,
+ *      the active segment is immortal, 0 disables
+ *  11. wal_parse_max_bytes: plain bytes, K/M/G suffixes, rejects junk
  *
  * The fan-out/epoll paths are covered by tests/test-functional.sh
  * against a real broker process.
@@ -718,6 +721,94 @@ static void test_zmesg_agreement(void) {
 
 /* ---------------- main ---------------- */
 
+/* ---------------- 10. WAL retention (wal_prune) ---------------- */
+
+/* Write `bytes` zero bytes to WAL_DIR/segment-<base>.wal. */
+static void fake_segment(const char *dir, uint64_t base, size_t bytes) {
+    char path[512];
+    wal_segment_path(path, sizeof path, dir, base);
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    char zero[256] = {0};
+    while (bytes) {
+        size_t n = bytes < sizeof zero ? bytes : sizeof zero;
+        assert(fwrite(zero, 1, n, f) == n);
+        bytes -= n;
+    }
+    fclose(f);
+}
+
+static int segment_exists(const char *dir, uint64_t base) {
+    char path[512];
+    wal_segment_path(path, sizeof path, dir, base);
+    return access(path, F_OK) == 0;
+}
+
+static void test_wal_prune(void) {
+    SECTION("wal_prune retention");
+    char dir[] = "/tmp/pb-prune-XXXXXX";
+    assert(mkdtemp(dir));
+
+    /* Ten 1000-byte segments, bases 0,100,...,900. The active one is
+     * the highest base, exactly as wal_init/wal_append leave it. */
+    for (uint64_t b = 0; b <= 900; b += 100) fake_segment(dir, b, 1000);
+    wal_t w;
+    memset(&w, 0, sizeof w);
+    w.fd = -1;
+    snprintf(w.dir, sizeof w.dir, "%s", dir);
+    w.base_sequence = 900;
+
+    /* 0 = unbounded: nothing is deleted. */
+    CHECK(wal_prune(&w, 0) == 0);
+    for (uint64_t b = 0; b <= 900; b += 100) CHECK(segment_exists(dir, b));
+
+    /* Cap 4500: keep the newest four (4000 bytes); a fifth would be
+     * 5000. Oldest six go, in base order. */
+    CHECK(wal_prune(&w, 4500) == 6);
+    for (uint64_t b = 0; b <= 500; b += 100) CHECK(!segment_exists(dir, b));
+    for (uint64_t b = 600; b <= 900; b += 100) CHECK(segment_exists(dir, b));
+
+    /* Already under the cap: a second call is a no-op. */
+    CHECK(wal_prune(&w, 4500) == 0);
+
+    /* Cap smaller than the active segment itself: everything else goes,
+     * the active segment is never unlinked. */
+    CHECK(wal_prune(&w, 1) == 3);
+    CHECK(!segment_exists(dir, 600));
+    CHECK(!segment_exists(dir, 800));
+    CHECK(segment_exists(dir, 900));
+
+    /* Non-segment files in the directory are ignored, not deleted. */
+    char other[600];
+    snprintf(other, sizeof other, "%s/notes.txt", dir);
+    FILE *f = fopen(other, "wb"); assert(f); fputs("keep me", f); fclose(f);
+    CHECK(wal_prune(&w, 1) == 0);
+    CHECK(access(other, F_OK) == 0);
+
+    unlink(other);
+    char path[512];
+    wal_segment_path(path, sizeof path, dir, 900);
+    unlink(path);
+    rmdir(dir);
+}
+
+/* ---------------- 11. WAL_MAX_BYTES parsing ---------------- */
+
+static void test_wal_parse_max_bytes(void) {
+    SECTION("wal_parse_max_bytes");
+    uint64_t v = 1;
+    CHECK(wal_parse_max_bytes("0", &v) == 0 && v == 0);
+    CHECK(wal_parse_max_bytes("4096", &v) == 0 && v == 4096);
+    CHECK(wal_parse_max_bytes("512K", &v) == 0 && v == 512ull * 1024);
+    CHECK(wal_parse_max_bytes("64M", &v) == 0 && v == 64ull << 20);
+    CHECK(wal_parse_max_bytes("4G", &v) == 0 && v == 4ull << 30);
+    CHECK(wal_parse_max_bytes("4g", &v) == 0 && v == 4ull << 30);
+    CHECK(wal_parse_max_bytes("", &v) == -1);
+    CHECK(wal_parse_max_bytes("abc", &v) == -1);
+    CHECK(wal_parse_max_bytes("4GB", &v) == -1);
+    CHECK(wal_parse_max_bytes("-1", &v) == -1);
+}
+
 int main(void) {
     printf("planetar-broker unit tests\n");
     printf("(broker LOG lines below are expected — the WAL tests\n");
@@ -736,6 +827,8 @@ int main(void) {
     test_pub_burst_backlog();
     test_producer_drain();
     test_zmesg_agreement();
+    test_wal_prune();
+    test_wal_parse_max_bytes();
 
     printf("\n%d passed, %d failed\n", t_pass, t_fail);
     return t_fail ? 1 : 0;
