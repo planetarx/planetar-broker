@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`planetar-broker` is a single-file C message bus (`planetar-broker.c`, ~2.1 k
-lines, roughly half doc comments) plus a ~220-LOC reference SHM consumer
+`planetar-broker` is a single-file C message bus (`planetar-broker.c`, ~3.3 k
+lines as of 2026-10-13, a large share doc comments) plus a ~220-LOC reference SHM consumer
 (`shm-consumer.c`). It is the "Bus" component of the planetar / IDEaS CH13
 proposal spine. Proposal claims that cite LOC or benchmarks should be verified
 against this repo.
